@@ -10,24 +10,26 @@ public final class Main {
 
     private static void help() {
         System.out.println("""
-            Draco → GLB decoder
+            Draco → GLB decoder (+ rotate-flat bake like your Node script)
 
             Usage:
               java -jar draco-decoder-cli-1.0.0-all.jar -f <in.glb> [-f <in2.glb> ...]
                                                      [-filelist <list.txt>]
-                                                     [-o <outdir>] [-j <jobs>] [-v] [-h]
+                                                     [-o <outdir>] [-j <jobs>] [-r] [--scale] [-v] [-h]
 
             Options:
               -f <path>            Input GLB/GLTF (repeatable). Draco OK.
               -filelist <txt>      Text file with one input path per line
-              -o <dir>             Output directory (default ./out). Each file becomes <name>-decoded.glb
+              -o <dir>             Output directory (default ./out). Each file → <name>-decoded.glb
               -j <jobs>            Parallel jobs (default: #CPU)
+              -r, --rotate-flat    Apply M' = RS * (T(-C) * M) to ROOTS, then:
+                                   • bake each ROOT's current (R·S) into its own mesh vertices/normals/tangents(+morphs),
+                                   • set that root to translation-only,
+                                   • pre-multiply direct children by the same RS.
+                                   (Exactly like your rotateUtils.js.)
+              --scale              Include uniform scale S = 1/diag (world AABB diagonal).
               -v                   Verbose
               -h                   Show this help
-
-            Notes:
-              • Requires LWJGL Assimp with Draco (bundled in LWJGL 3.3.2+).
-              • Output is standard GLB (no Draco).
             """);
     }
 
@@ -38,6 +40,8 @@ public final class Main {
         File outDir = new File("out");
         boolean verbose = false;
         int jobs = Math.max(1, Runtime.getRuntime().availableProcessors());
+        boolean rotateFlat = false;
+        boolean scaleOn = false;
 
         try {
             for (int i = 0; i < args.length; i++) {
@@ -65,6 +69,8 @@ public final class Main {
                             if (!p.isEmpty()) inputs.add(new File(p));
                         }
                     }
+                    case "-r", "--rotate-flat" -> rotateFlat = true;
+                    case "--scale" -> scaleOn = true;
                     default -> {
                         if (a.startsWith("-")) {
                             System.err.println("Unknown option: " + a);
@@ -89,10 +95,12 @@ public final class Main {
 
             System.out.println("[CLI] Files=" + inputs.size());
             System.out.println("[CLI] Output: " + outDir.getAbsolutePath());
-            System.out.println("[CLI] Jobs=" + jobs + "  Verbose=" + verbose);
+            System.out.println("[CLI] Jobs=" + jobs + "  RotateFlat=" + rotateFlat + "  Scale=" + scaleOn + "  Verbose=" + verbose);
 
             final File outDirF = outDir;
             final boolean verboseF = verbose;
+            final boolean rotateFlatF = rotateFlat;
+            final boolean scaleOnF = scaleOn;
 
             ExecutorService pool = (jobs > 1)
                     ? Executors.newWorkStealingPool(jobs)
@@ -107,7 +115,7 @@ public final class Main {
                         String base = stripExt(in.getName());
                         File out = new File(outDirF, base + "-decoded.glb");
                         long t = System.nanoTime();
-                        AssimpDracoDecode.decodeToUncompressedGlb(in, out, verboseF);
+                        AssimpDracoDecode.decodeToUncompressedGlb(in, out, verboseF, rotateFlatF, scaleOnF);
                         long dt = System.nanoTime() - t;
                         System.out.printf("[OK] %-40s → %s  (%.1f ms)%n",
                                 in.getName(), out.getName(), dt / 1e6);
