@@ -1,4 +1,4 @@
-// AssimpDracoDecode.java (verbose, root-fallback, real baking)
+// AssimpDracoDecode.java (origin support + Node-parity per-root bake)
 
 package com.example.draco;
 
@@ -13,6 +13,17 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 
+/**
+ * GLB rotate-flat with Draco decode via LWJGL Assimp.
+ * Node-parity behavior:
+ *   - Optional shared origin (ECEF) provided by caller; if null, use world bbox center.
+ *   - Geodetic up = normalize(origin or center) rotated to +Y.
+ *   - Strict step: for each "root" (children of Assimp root, or root itself if no children),
+ *       M' = RS_row * ( T(-C) * M )
+ *   - Bake ONLY the ROOTS' current R*S into their meshes.
+ *   - Flatten ROOTS to translation-only; pre-multiply DIRECT children by ROOTS' RS (no recursion).
+ *   - Disallow baking roots whose mesh is shared by multiple nodes. Disallow skins under roots.
+ */
 public final class AssimpDracoDecode {
 
     private AssimpDracoDecode() {}
@@ -24,12 +35,26 @@ public final class AssimpDracoDecode {
     }
     private static String nm(AINode n){ return n!=null && n.mName()!=null ? n.mName().dataString() : "<unnamed>"; }
 
-    // ---------- public API ----------
+    // ---------- public API (overloads keep BC; new overload adds origin) ----------
     public static void decodeToUncompressedGlb(File input, File output, boolean verbose) throws Exception {
-        decodeToUncompressedGlb(input, output, verbose, false, false);
+        decodeToUncompressedGlb(input, output, verbose, false, false, (float[])null);
     }
     public static void decodeToUncompressedGlb(File input, File output, boolean verbose,
                                                boolean rotateFlat, boolean scaleOn) throws Exception {
+        decodeToUncompressedGlb(input, output, verbose, rotateFlat, scaleOn, (float[])null);
+    }
+    /** New API: provide optional shared origin (ECEF X,Y,Z). If null, center is from world bbox. */
+    public static void decodeToUncompressedGlb(File input, File output, boolean verbose,
+                                               boolean rotateFlat, boolean scaleOn, double[] origin) throws Exception {
+        float[] o = null;
+        if (origin != null && origin.length == 3) {
+            o = new float[]{ (float)origin[0], (float)origin[1], (float)origin[2] };
+        }
+        decodeToUncompressedGlb(input, output, verbose, rotateFlat, scaleOn, o);
+    }
+    /** New API: provide optional shared origin (ECEF X,Y,Z) as float[]. */
+    public static void decodeToUncompressedGlb(File input, File output, boolean verbose,
+                                               boolean rotateFlat, boolean scaleOn, float[] origin) throws Exception {
         if (!input.isFile()) throw new IllegalArgumentException("Input does not exist: " + input);
 
         if (verbose) { Configuration.DISABLE_FUNCTION_CHECKS.set(false); Configuration.DEBUG.set(true); }
@@ -52,7 +77,7 @@ public final class AssimpDracoDecode {
         if (scene == null) throw new IllegalStateException("Assimp import failed: " + Assimp.aiGetErrorString());
 
         try {
-            if (rotateFlat) rotateStrictThenBakeRecursive(scene, verbose, scaleOn);
+            if (rotateFlat) rotateStrictThenBake_NodeExact_WithOrigin(scene, verbose, scaleOn, origin);
 
             Path outPath = output.toPath();
             Files.createDirectories(outPath.getParent());
@@ -62,295 +87,6 @@ public final class AssimpDracoDecode {
         } finally {
             Assimp.aiReleaseImport(scene);
         }
-    }
-
-    // ---------- main flow (with robust root picking + lots of logs) ----------
-    private static void rotateStrictThenBakeRecursive(AIScene scene, boolean verbose, boolean scaleOn) {
-        if (scene.mRootNode() == null) return;
-
-        WorldStats stats0 = worldStatsFromOriginal(scene);
-        float[] C = stats0.center;
-        double diag = stats0.diag;
-        dbg(verbose, "[BBox] center=(%.6f,%.6f,%.6f) diag=%.6f", C[0], C[1], C[2], diag);
-
-        float[] up = normalize3(C);
-        if (!isFinite3(up) || (Math.abs(up[0])+Math.abs(up[1])+Math.abs(up[2])<1e-8f)) up = new float[]{0,1,0};
-        float[] q = quatFromUnitVectors(up, new float[]{0,1,0});
-        float s  = scaleOn ? (diag>0 ? (float)(1.0/diag) : 1f) : 1f;
-
-        // axis/angle for logs
-        double ang = Math.toDegrees(2.0 * Math.acos(clamp(q[3], -1f, 1f)));
-        double sinHalf = Math.sqrt(Math.max(0.0, 1.0 - q[3]*q[3]));
-        float ax=0,ay=1,az=0; if (sinHalf>1e-8){ ax=(float)(q[0]/sinHalf); ay=(float)(q[1]/sinHalf); az=(float)(q[2]/sinHalf); }
-
-        dbgVec(verbose, "[RotateFlat] geodeticUp", up);
-        dbg(verbose, "[RotateFlat] quaternion q = (x=%.6f, y=%.6f, z=%.6f, w=%.6f)  angle=%.3f°  axis=(%.4f,%.4f,%.4f)",
-                q[0],q[1],q[2],q[3],ang,ax,ay,az);
-        dbg(verbose, "[RotateFlat] scale s = %.9f (uniform)", s);
-
-        float[] qUp = rotateVecByQuat(up, q);
-        dbgVec(verbose, "[Diag] up rotated by q", qUp);
-        dbg(verbose, "[Diag] dot(q*up, +Y) = %.9f (1.0 = perfect)", dot(qUp, new float[]{0,1,0}));
-
-        // Build both RS variants and pick one by “does up→+Y?”
-        float[] RS4_row = composeTRS_row(new float[]{0,0,0}, q, new float[]{s,s,s});
-        float[] RS4_col = composeTRS_col(new float[]{0,0,0}, q, s);
-        float[] RS3_row = mat3FromMat4(RS4_row);
-        float[] RS3_col = mat3FromMat4(RS4_col);
-        float dotRow = dot(applyMat3(RS3_row, up), new float[]{0,1,0});
-        float dotCol = dot(applyMat3(RS3_col, up), new float[]{0,1,0});
-        final boolean USE_ROW = Math.abs(1.0 - dotRow) <= Math.abs(1.0 - dotCol);
-        final float[] RS4 = USE_ROW ? RS4_row : RS4_col;
-        dbg(verbose, "[Diag] dot(RS_row*up,+Y)=%.9f dot(RS_col*up,+Y)=%.9f  → RS MAPPING = %s",
-                dotRow, dotCol, USE_ROW ? "ROW" : "COL");
-
-        // Abort on mesh sharing (matches Node)
-        Map<Integer,Integer> uses = countMeshUses(scene.mRootNode());
-        for (Map.Entry<Integer,Integer> e : uses.entrySet()){
-            if (e.getValue() > 1)
-                throw new IllegalStateException("Mesh index "+e.getKey()+" used by "+e.getValue()+" nodes; duplicate per-node before baking.");
-        }
-
-        // --- PICK ROOTS (critical fix): if no children, treat the Assimp root as a root ---
-        AINode aiRoot = scene.mRootNode();
-        List<AINode> roots = new ArrayList<>();
-        if (aiRoot.mNumChildren() > 0){
-            PointerBuffer pb = aiRoot.mChildren();
-            for (int i=0;i<aiRoot.mNumChildren();i++) roots.add(AINode.create(pb.get(i)));
-            dbg(verbose, "[Roots] Using %d children of Assimp root as roots.", roots.size());
-        } else {
-            roots.add(aiRoot);
-            dbg(verbose, "[Roots] Assimp root has no children → treating ROOT itself \"%s\" as the sole root.", nm(aiRoot));
-        }
-
-        // Diagnostic: count meshes under each chosen root
-        for (AINode r : roots){
-            int subMeshes = countMeshesUnder(r);
-            dbg(verbose, "[Roots] root \"%s\" subtree meshes=%d", nm(r), subMeshes);
-        }
-
-        // Apply strict to roots
-        float[] Tpre = composeTRS_Tpre(C);
-        for (AINode r : roots){
-            float[] M0 = toCM(r.mTransformation());
-            float[] M1 = mat4Mul(Tpre, M0);
-            float[] M2 = mat4Mul(RS4, M1);
-            dbg(verbose, "[Strict] root \"%s\": M' = RS * (T(-C) * M)", nm(r));
-            fromCM(M2, r.mTransformation());
-        }
-
-        // Recurse + bake
-        long totalChanged = 0;
-        for (AINode r : roots){
-            totalChanged += bakeNodeRSIntoMeshesPushChildren(scene, r, verbose, USE_ROW);
-        }
-
-        // Post check bbox to give visual confidence
-        WorldStats stats1 = worldStatsFromOriginal(scene);
-        dbg(verbose, "[PostBBox] center=(%.6f,%.6f,%.6f) diag=%.6f  changedVertices=%d",
-                stats1.center[0], stats1.center[1], stats1.center[2], stats1.diag, totalChanged);
-
-        dbg(verbose, "[RotateFlat] DONE: strict applied; RS baked; nodes flattened; children premultiplied.");
-    }
-
-    // returns number of vertices that changed at/under this node
-    private static long bakeNodeRSIntoMeshesPushChildren(AIScene scene, AINode node, boolean verbose, boolean USE_ROW) {
-        if (node == null) return 0;
-        long changedTotal = 0;
-
-        float[] M = toCM(node.mTransformation());
-        TRS trs   = decomposeTRS(M);
-
-        float[] RS4 = USE_ROW
-                ? composeTRS_row(new float[]{0,0,0}, trs.r, trs.s)
-                : composeTRS_col(new float[]{0,0,0}, trs.r, 1.0f);  // uniform scale done via row path; rotation still right
-
-        float[] RS3 = mat3FromMat4(RS4);
-        float[] inv3 = mat3Inverse(RS3);
-        if (inv3 == null) throw new IllegalStateException("Non-invertible RS at node \""+nm(node)+"\"");
-        float[] normalM = mat3Transpose(inv3);
-
-        PointerBuffer sceneMeshes = scene.mMeshes();
-
-        int localMeshes = 0;
-        int changedHere = 0;
-        float maxDelta = 0f;
-
-        // disallow skins
-        IntBuffer meshIdx = node.mMeshes();
-        if (meshIdx != null) {
-            for (int k=0;k<node.mNumMeshes();k++){
-                int mi = meshIdx.get(k);
-                AIMesh mx = AIMesh.create(sceneMeshes.get(mi));
-                if (mx!=null && mx.mNumBones()>0)
-                    throw new IllegalStateException("Skinned mesh on node \""+nm(node)+"\" unsupported.");
-            }
-        }
-
-        if (meshIdx != null) {
-            for (int k=0;k<node.mNumMeshes();k++){
-                int mi = meshIdx.get(k);
-                AIMesh m = AIMesh.create(sceneMeshes.get(mi));
-                if (m==null) continue;
-                localMeshes++;
-
-                // sample before
-                float[] before = null;
-                if (m.mNumVertices()>0 && m.mVertices()!=null){
-                    AIVector3D p0 = m.mVertices().get(0);
-                    before = new float[]{p0.x(),p0.y(),p0.z()};
-                }
-
-                // POSITIONS
-                AIVector3D.Buffer vtx = m.mVertices();
-                if (vtx!=null){
-                    for (int vi=0;vi<m.mNumVertices();vi++){
-                        AIVector3D p = vtx.get(vi);
-                        float x=p.x(), y=p.y(), z=p.z();
-                        float nx = RS3[0]*x + RS3[3]*y + RS3[6]*z;
-                        float ny = RS3[1]*x + RS3[4]*y + RS3[7]*z;
-                        float nz = RS3[2]*x + RS3[5]*y + RS3[8]*z;
-                        float dx = nx-x, dy=ny-y, dz=nz-z;
-                        float dL = (float)Math.sqrt(dx*dx+dy*dy+dz*dz);
-                        if (dL>1e-9){ changedHere++; if (dL>maxDelta) maxDelta=dL; }
-                        p.set(nx,ny,nz);
-                    }
-                }
-
-                // NORMALS (renorm)
-                AIVector3D.Buffer nrm = m.mNormals();
-                if (nrm!=null){
-                    for (int vi=0;vi<m.mNumVertices();vi++){
-                        AIVector3D n = nrm.get(vi);
-                        float x=n.x(), y=n.y(), z=n.z();
-                        float nx = normalM[0]*x + normalM[3]*y + normalM[6]*z;
-                        float ny = normalM[1]*x + normalM[4]*y + normalM[7]*z;
-                        float nz = normalM[2]*x + normalM[5]*y + normalM[8]*z;
-                        float L=(float)Math.sqrt(nx*nx+ny*ny+nz*nz);
-                        if (L>0){ nx/=L; ny/=L; nz/=L; }
-                        n.set(nx,ny,nz);
-                    }
-                }
-
-                // TANGENTS (renorm)
-                AIVector3D.Buffer tan = m.mTangents();
-                if (tan!=null){
-                    for (int vi=0;vi<m.mNumVertices();vi++){
-                        AIVector3D t = tan.get(vi);
-                        float x=t.x(), y=t.y(), z=t.z();
-                        float nx = normalM[0]*x + normalM[3]*y + normalM[6]*z;
-                        float ny = normalM[1]*x + normalM[4]*y + normalM[7]*z;
-                        float nz = normalM[2]*x + normalM[5]*y + normalM[8]*z;
-                        float L=(float)Math.sqrt(nx*nx+ny*ny+nz*nz);
-                        if (L>0){ nx/=L; ny/=L; nz/=L; }
-                        t.set(nx,ny,nz);
-                    }
-                }
-
-                // BITANGENTS (renorm)
-                AIVector3D.Buffer bit = m.mBitangents();
-                if (bit!=null){
-                    for (int vi=0;vi<m.mNumVertices();vi++){
-                        AIVector3D b = bit.get(vi);
-                        float x=b.x(), y=b.y(), z=b.z();
-                        float nx = normalM[0]*x + normalM[3]*y + normalM[6]*z;
-                        float ny = normalM[1]*x + normalM[4]*y + normalM[7]*z;
-                        float nz = normalM[2]*x + normalM[5]*y + normalM[8]*z;
-                        float L=(float)Math.sqrt(nx*nx+ny*ny+nz*nz);
-                        if (L>0){ nx/=L; ny/=L; nz/=L; }
-                        b.set(nx,ny,nz);
-                    }
-                }
-
-                // Morph targets (deltas: rotate, NO renorm)
-                PointerBuffer anims = m.mAnimMeshes();
-                if (anims!=null){
-                    for (int j=0;j<m.mNumAnimMeshes();j++){
-                        AIAnimMesh am = AIAnimMesh.create(anims.get(j));
-                        AIVector3D.Buffer mv = am.mVertices();
-                        if (mv!=null){
-                            for (int vi=0;vi<am.mNumVertices();vi++){
-                                AIVector3D p = mv.get(vi);
-                                float x=p.x(), y=p.y(), z=p.z();
-                                float nx = RS3[0]*x + RS3[3]*y + RS3[6]*z;
-                                float ny = RS3[1]*x + RS3[4]*y + RS3[7]*z;
-                                float nz = RS3[2]*x + RS3[5]*y + RS3[8]*z;
-                                p.set(nx,ny,nz);
-                            }
-                        }
-                        AIVector3D.Buffer mn = am.mNormals();
-                        if (mn!=null){
-                            for (int vi=0;vi<am.mNumVertices();vi++){
-                                AIVector3D n = mn.get(vi);
-                                float x=n.x(), y=n.y(), z=n.z();
-                                float nx = normalM[0]*x + normalM[3]*y + normalM[6]*z;
-                                float ny = normalM[1]*x + normalM[4]*y + normalM[7]*z;
-                                float nz = normalM[2]*x + normalM[5]*y + normalM[8]*z;
-                                n.set(nx,ny,nz);
-                            }
-                        }
-                        AIVector3D.Buffer mt = am.mTangents();
-                        if (mt!=null){
-                            for (int vi=0;vi<am.mNumVertices();vi++){
-                                AIVector3D t = mt.get(vi);
-                                float x=t.x(), y=t.y(), z=t.z();
-                                float nx = normalM[0]*x + normalM[3]*y + normalM[6]*z;
-                                float ny = normalM[1]*x + normalM[4]*y + normalM[7]*z;
-                                float nz = normalM[2]*x + normalM[5]*y + normalM[8]*z;
-                                t.set(nx,ny,nz);
-                            }
-                        }
-                        AIVector3D.Buffer mb = am.mBitangents();
-                        if (mb!=null){
-                            for (int vi=0;vi<am.mNumVertices();vi++){
-                                AIVector3D b = mb.get(vi);
-                                float x=b.x(), y=b.y(), z=b.z();
-                                float nx = normalM[0]*x + normalM[3]*y + normalM[6]*z;
-                                float ny = normalM[1]*x + normalM[4]*y + normalM[7]*z;
-                                float nz = normalM[2]*x + normalM[5]*y + normalM[8]*z;
-                                b.set(nx,ny,nz);
-                            }
-                        }
-                    }
-                }
-
-                if (verbose && before!=null){
-                    AIVector3D a = m.mVertices().get(0);
-                    dbg(verbose, "[BakeNode] \"%s\" mesh=%d v0 before=(%.6f,%.6f,%.6f) after=(%.6f,%.6f,%.6f)",
-                            nm(node), mi, before[0],before[1],before[2], a.x(),a.y(),a.z());
-                }
-            }
-        }
-
-        dbg(verbose, "[BakeNode] \"%s\" meshes=%d  Δpos count=%d  maxΔ=%.9g", nm(node), localMeshes, changedHere, maxDelta);
-        changedTotal += changedHere;
-
-        // flatten node to T-only
-        setTranslationOnly(node.mTransformation(), trs.t);
-
-        // push RS to children, recurse
-        PointerBuffer kids = node.mChildren();
-        for (int c=0;c<node.mNumChildren();c++){
-            AINode child = AINode.create(kids.get(c));
-            float[] C0 = toCM(child.mTransformation());
-            float[] C1 = mat4Mul(RS4, C0);
-            fromCM(C1, child.mTransformation());
-            dbg(verbose, "[PushRS] \"%s\" → child \"%s\"", nm(node), nm(child));
-            changedTotal += bakeNodeRSIntoMeshesPushChildren(scene, child, verbose, USE_ROW);
-        }
-        return changedTotal;
-    }
-
-    // ---------- math & utils ----------
-    private static boolean isFinite3(float[] v){ return Float.isFinite(v[0])&&Float.isFinite(v[1])&&Float.isFinite(v[2]); }
-    private static float clamp(float x, float lo, float hi){ return Math.max(lo, Math.min(hi,x)); }
-    private static float dot(float[] a, float[] b){ return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
-    private static float[] normalize3(float[] v){ double L=Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); if(!(L>0)) return new float[]{0,0,0}; return new float[]{(float)(v[0]/L),(float)(v[1]/L),(float)(v[2]/L)}; }
-    private static float[] cross(float[] a,float[] b){ return new float[]{a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]}; }
-    private static float[] rotateVecByQuat(float[] v,float[] q){
-        float vx=v[0],vy=v[1],vz=v[2], qx=q[0],qy=q[1],qz=q[2],qw=q[3];
-        float ix=qw*vx+qy*vz-qz*vy, iy=qw*vy+qz*vx-qx*vz, iz=qw*vz+qx*vy-qy*vx, iw=-qx*vx-qy*vy-qz*vz;
-        return new float[]{ ix*qw + iw*-qx + iy*-qz - iz*-qy,  iy*qw + iw*-qy + iz*-qx - ix*-qz,  iz*qw + iw*-qz + ix*-qy - iy*-qx };
     }
 
     private static float[] quatFromUnitVectors(float[] from,float[] to){
@@ -369,6 +105,257 @@ public final class AssimpDracoDecode {
         return new float[]{axis[0]*inv,axis[1]*inv,axis[2]*inv,s*0.5f};
     }
 
+    // ---------- main flow (Node-parity with ORIGIN support; per-root bake, no recursion) ----------
+    private static void rotateStrictThenBake_NodeExact_WithOrigin(AIScene scene, boolean verbose, boolean scaleOn, float[] originOpt) {
+        if (scene.mRootNode() == null) return;
+
+        // Measure from original scene
+        WorldStats stats0 = worldStatsFromOriginal(scene);
+        float[] statsCenter = stats0.center;
+        double diagMeasured = stats0.diag;
+
+        // CENTER/ORIGIN: if origin provided, use it as the world "center"; else use measured center
+        float[] C = (originOpt != null && originOpt.length == 3) ? new float[]{originOpt[0], originOpt[1], originOpt[2]} : statsCenter;
+        double diag = diagMeasured; // used only if scaleOn
+        dbg(verbose, "[BBox] center=(%.6f,%.6f,%.6f) diag=%.6f  (note: center overridden by origin=%s)",
+                statsCenter[0], statsCenter[1], statsCenter[2], diagMeasured,
+                (originOpt!=null?"true":"false"));
+
+        // geodetic up from center/origin -> +Y
+        float[] up = normalize3(C);
+        if (!isFinite3(up) || (Math.abs(up[0])+Math.abs(up[1])+Math.abs(up[2])<1e-8f)) up = new float[]{0,1,0};
+        float[] q = quatFromUnitVectors(up, new float[]{0,1,0});
+        float s  = scaleOn ? (diag>0 ? (float)(1.0/diag) : 1f) : 1f;
+
+        // logs
+        double ang = Math.toDegrees(2.0 * Math.acos(clamp(q[3], -1f, 1f)));
+        double sinHalf = Math.sqrt(Math.max(0.0, 1.0 - q[3]*q[3]));
+        float ax=0,ay=1,az=0; if (sinHalf>1e-8){ ax=(float)(q[0]/sinHalf); ay=(float)(q[1]/sinHalf); az=(float)(q[2]/sinHalf); }
+        dbgVec(verbose, "[RotateFlat] geodeticUp", up);
+        dbg(verbose, "[RotateFlat] quaternion q = (x=%.6f, y=%.6f, z=%.6f, w=%.6f)  angle=%.3f°  axis=(%.4f,%.4f,%.4f)",
+                q[0],q[1],q[2],q[3],ang,ax,ay,az);
+        dbg(verbose, "[RotateFlat] scale s = %.9f (uniform)", s);
+
+        // Node mapping: ROW-scaled compose only
+        float[] RS4 = composeTRS_row(new float[]{0,0,0}, q, new float[]{s,s,s});
+        float[] Tpre = composeTRS_Tpre(C);
+
+        // Abort on mesh sharing: we'll only bake ROOT meshes, so check only for those later.
+        Map<Integer,Integer> uses = countMeshUses(scene.mRootNode());
+
+        // Pick roots = children of Assimp root; fallback to root itself
+        AINode aiRoot = scene.mRootNode();
+        List<AINode> roots = new ArrayList<>();
+        if (aiRoot.mNumChildren() > 0){
+            PointerBuffer pb = aiRoot.mChildren();
+            for (int i=0;i<aiRoot.mNumChildren();i++) roots.add(AINode.create(pb.get(i)));
+            dbg(verbose, "[Roots] Using %d children of Assimp root as roots.", roots.size());
+        } else {
+            roots.add(aiRoot);
+            dbg(verbose, "[Roots] Assimp root has no children → treating ROOT itself \"%s\" as the sole root.", nm(aiRoot));
+        }
+
+        for (AINode r : roots){
+            int subMeshes = countMeshesUnder(r);
+            dbg(verbose, "[Roots] root \"%s\" subtree meshes=%d", nm(r), subMeshes);
+        }
+
+        // Strict step: M' = RS * (T(-C) * M)  (applied to roots)
+        for (AINode r : roots){
+            float[] M0 = toCM(r.mTransformation());
+            float[] M1 = mat4Mul(Tpre, M0);
+            float[] M2 = mat4Mul(RS4, M1);
+            dbg(verbose, "[Strict] root \"%s\": M' = RS * (T(-C) * M)", nm(r));
+            fromCM(M2, r.mTransformation());
+        }
+
+        // Per-root bake (Node exact): only meshes owned by the root; flatten root to T-only; pre-multiply direct children by current RS
+        PointerBuffer sceneMeshes = scene.mMeshes();
+        long changedTotal = 0;
+
+        for (AINode r : roots){
+            // Decompose ROOT's current transform to get R,S to bake
+            float[] Mr  = toCM(r.mTransformation());
+            TRS prs     = decomposeTRS(Mr);
+            float[] RS4_current = composeTRS_row(new float[]{0,0,0}, prs.r, prs.s);
+            float[] RS3_current = mat3FromMat4(RS4_current);
+            float[] inv3 = mat3Inverse(RS3_current);
+            if (inv3 == null) throw new IllegalStateException("Non-invertible RS at root \""+nm(r)+"\"");
+            float[] normalM = mat3Transpose(inv3);
+
+            // Node limitations: mesh reuse & skins, but only for ROOT's own meshes
+            IntBuffer meshIdx = r.mMeshes();
+            if (meshIdx != null) {
+                for (int k=0;k<r.mNumMeshes();k++){
+                    int mi = meshIdx.get(k);
+                    if (uses.getOrDefault(mi,0) > 1)
+                        throw new IllegalStateException("Mesh "+mi+" is used by multiple nodes; duplicate per-node before baking (Node limitation).");
+                    AIMesh mx = AIMesh.create(sceneMeshes.get(mi));
+                    if (mx!=null && mx.mNumBones()>0)
+                        throw new IllegalStateException("Skinned mesh under root \""+nm(r)+"\" unsupported (Node limitation).");
+                }
+            }
+
+            int changedHere = 0; float maxDelta = 0f;
+
+            // Bake ROOT meshes only
+            if (meshIdx != null) {
+                for (int k=0;k<r.mNumMeshes();k++){
+                    int mi = meshIdx.get(k);
+                    AIMesh m = AIMesh.create(sceneMeshes.get(mi));
+                    if (m==null) continue;
+
+                    // Positions
+                    AIVector3D.Buffer vtx = m.mVertices();
+                    if (vtx!=null){
+                        for (int vi=0;vi<m.mNumVertices();vi++){
+                            AIVector3D p = vtx.get(vi);
+                            float x=p.x(),y=p.y(),z=p.z();
+                            float nx = RS3_current[0]*x + RS3_current[3]*y + RS3_current[6]*z;
+                            float ny = RS3_current[1]*x + RS3_current[4]*y + RS3_current[7]*z;
+                            float nz = RS3_current[2]*x + RS3_current[5]*y + RS3_current[8]*z;
+                            float dx=nx-x, dy=ny-y, dz=nz-z;
+                            float dL=(float)Math.sqrt(dx*dx+dy*dy+dz*dz);
+                            if (dL>1e-9){ changedHere++; if (dL>maxDelta) maxDelta=dL; }
+                            p.set(nx,ny,nz);
+                        }
+                    }
+
+                    // Normals/tangents/bitangents (base: renorm; morph: NO renorm)
+                    AIVector3D.Buffer nrm = m.mNormals();
+                    if (nrm!=null){
+                        for (int vi=0;vi<m.mNumVertices();vi++){
+                            AIVector3D n = nrm.get(vi);
+                            float x=n.x(),y=n.y(),z=n.z();
+                            float nx = normalM[0]*x + normalM[3]*y + normalM[6]*z;
+                            float ny = normalM[1]*x + normalM[4]*y + normalM[7]*z;
+                            float nz = normalM[2]*x + normalM[5]*y + normalM[8]*z;
+                            float L=(float)Math.sqrt(nx*nx+ny*ny+nz*nz);
+                            if (L>0){ nx/=L; ny/=L; nz/=L; }
+                            n.set(nx,ny,nz);
+                        }
+                    }
+                    AIVector3D.Buffer tan = m.mTangents();
+                    if (tan!=null){
+                        for (int vi=0;vi<m.mNumVertices();vi++){
+                            AIVector3D t = tan.get(vi);
+                            float x=t.x(),y=t.y(),z=t.z();
+                            float nx = normalM[0]*x + normalM[3]*y + normalM[6]*z;
+                            float ny = normalM[1]*x + normalM[4]*y + normalM[7]*z;
+                            float nz = normalM[2]*x + normalM[5]*y + normalM[8]*z;
+                            float L=(float)Math.sqrt(nx*nx+ny*ny+nz*nz);
+                            if (L>0){ nx/=L; ny/=L; nz/=L; }
+                            t.set(nx,ny,nz);
+                        }
+                    }
+                    AIVector3D.Buffer bit = m.mBitangents();
+                    if (bit!=null){
+                        for (int vi=0;vi<m.mNumVertices();vi++){
+                            AIVector3D b = bit.get(vi);
+                            float x=b.x(),y=b.y(),z=b.z();
+                            float nx = normalM[0]*x + normalM[3]*y + normalM[6]*z;
+                            float ny = normalM[1]*x + normalM[4]*y + normalM[7]*z;
+                            float nz = normalM[2]*x + normalM[5]*y + normalM[8]*z;
+                            float L=(float)Math.sqrt(nx*nx+ny*ny+nz*nz);
+                            if (L>0){ nx/=L; ny/=L; nz/=L; }
+                            b.set(nx,ny,nz);
+                        }
+                    }
+
+                    // Morph targets (deltas)
+                    PointerBuffer anims = m.mAnimMeshes();
+                    if (anims!=null){
+                        for (int j=0;j<m.mNumAnimMeshes();j++){
+                            AIAnimMesh am = AIAnimMesh.create(anims.get(j));
+                            AIVector3D.Buffer mv = am.mVertices();    // deltas
+                            if (mv!=null){
+                                for (int vi=0;vi<am.mNumVertices();vi++){
+                                    AIVector3D p = mv.get(vi);
+                                    float x=p.x(),y=p.y(),z=p.z();
+                                    float nx = RS3_current[0]*x + RS3_current[3]*y + RS3_current[6]*z;
+                                    float ny = RS3_current[1]*x + RS3_current[4]*y + RS3_current[7]*z;
+                                    float nz = RS3_current[2]*x + RS3_current[5]*y + RS3_current[8]*z;
+                                    p.set(nx,ny,nz);
+                                }
+                            }
+                            AIVector3D.Buffer mn = am.mNormals();     // deltas
+                            if (mn!=null){
+                                for (int vi=0;vi<am.mNumVertices();vi++){
+                                    AIVector3D n = mn.get(vi);
+                                    float x=n.x(),y=n.y(),z=n.z();
+                                    float nx = normalM[0]*x + normalM[3]*y + normalM[6]*z;
+                                    float ny = normalM[1]*x + normalM[4]*y + normalM[7]*z;
+                                    float nz = normalM[2]*x + normalM[5]*y + normalM[8]*z;
+                                    n.set(nx,ny,nz);
+                                }
+                            }
+                            AIVector3D.Buffer mt = am.mTangents();    // deltas
+                            if (mt!=null){
+                                for (int vi=0;vi<am.mNumVertices();vi++){
+                                    AIVector3D t = mt.get(vi);
+                                    float x=t.x(),y=t.y(),z=t.z();
+                                    float nx = normalM[0]*x + normalM[3]*y + normalM[6]*z;
+                                    float ny = normalM[1]*x + normalM[4]*y + normalM[7]*z;
+                                    float nz = normalM[2]*x + normalM[5]*y + normalM[8]*z;
+                                    t.set(nx,ny,nz);
+                                }
+                            }
+                            AIVector3D.Buffer mb = am.mBitangents();  // deltas
+                            if (mb!=null){
+                                for (int vi=0;vi<am.mNumVertices();vi++){
+                                    AIVector3D b = mb.get(vi);
+                                    float x=b.x(),y=b.y(),z=b.z();
+                                    float nx = normalM[0]*x + normalM[3]*y + normalM[6]*z;
+                                    float ny = normalM[1]*x + normalM[4]*y + normalM[7]*z;
+                                    float nz = normalM[2]*x + normalM[5]*y + normalM[8]*z;
+                                    b.set(nx,ny,nz);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            changedTotal += changedHere;
+
+            // Flatten ROOT to translation-only (Node): keep prs.t
+            setTranslationOnly(r.mTransformation(), prs.t);
+            dbg(verbose, "[RootsFinal] \"%s\" translation=(%.6f, %.6f, %.6f)", nm(r), prs.t[0], prs.t[1], prs.t[2]);
+
+            // Pre-multiply DIRECT children by ROOT's current RS (no recursion)
+            PointerBuffer kids = r.mChildren();
+            for (int c=0;c<r.mNumChildren();c++){
+                AINode child = AINode.create(kids.get(c));
+                float[] C0 = toCM(child.mTransformation());
+                float[] C1 = mat4Mul(RS4_current, C0);
+                fromCM(C1, child.mTransformation());
+                dbg(verbose, "[PushRS] \"%s\" → child \"%s\"", nm(r), nm(child));
+            }
+
+            dbg(verbose, "[BakeRoot] \"%s\"  Δpos count=%d  maxΔ=%.9g", nm(r), changedHere, maxDelta);
+        }
+
+        // Post check bbox (visual confidence only)
+        WorldStats stats1 = worldStatsFromOriginal(scene);
+        dbg(verbose, "[PostBBox] center=(%.6f,%.6f,%.6f) diag=%.6f  changedVertices=%d",
+                stats1.center[0], stats1.center[1], stats1.center[2], stats1.diag, changedTotal);
+
+        dbg(verbose, "[RotateFlat] DONE: origin=%s; strict applied; ROOT RS baked; roots flattened; children premultiplied.",
+                (originOpt!=null?"provided":"auto-center"));
+    }
+
+    // ---------- math & utils ----------
+    private static boolean isFinite3(float[] v){ return Float.isFinite(v[0])&&Float.isFinite(v[1])&&Float.isFinite(v[2]); }
+    private static float clamp(float x, float lo, float hi){ return Math.max(lo, Math.min(hi,x)); }
+    private static float dot(float[] a, float[] b){ return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+    private static float[] normalize3(float[] v){ double L=Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); if(!(L>0)) return new float[]{0,0,0}; return new float[]{(float)(v[0]/L),(float)(v[1]/L),(float)(v[2]/L)}; }
+    private static float[] cross(float[] a,float[] b){ return new float[]{a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]}; }
+    private static float[] rotateVecByQuat(float[] v,float[] q){
+        float vx=v[0],vy=v[1],vz=v[2], qx=q[0],qy=q[1],qz=q[2],qw=q[3];
+        float ix=qw*vx+qy*vz-qz*vy, iy=qw*vy+qz*vx-qx*vz, iz=qw*vz+qx*vy-qy*vx, iw=-qx*vx-qy*vy-qz*vz;
+        return new float[]{ ix*qw + iw*-qx + iy*-qz - iz*-qy,  iy*qw + iw*-qy + iz*-qx - ix*-qz,  iz*qw + iw*-qz + ix*-qy - iy*-qx };
+    }
+
     // Node-like compose (row-scaled 3×3; column-major 4×4)
     private static float[] quatToMat3(float[] q){
         float x=q[0],y=q[1],z=q[2],w=q[3],x2=x+x,y2=y+y,z2=z+z,xx=x*x2,yy=y*y2,zz=z*z2,xy=x*y2,xz=x*z2,yz=y*z2,wx=w*x2,wy=w*y2,wz=w*z2;
@@ -380,11 +367,6 @@ public final class AssimpDracoDecode {
         float m10=R[3]*s[1], m11=R[4]*s[1], m12=R[5]*s[1];
         float m20=R[6]*s[2], m21=R[7]*s[2], m22=R[8]*s[2];
         return new float[]{ m00,m10,m20,0,  m01,m11,m21,0,  m02,m12,m22,0,  t[0],t[1],t[2],1 };
-    }
-    private static float[] composeTRS_col(float[] t,float[] q,float su){
-        float[] R = quatToMat3(q);
-        for(int i=0;i<9;i++) R[i]*=su;
-        return new float[]{ R[0],R[1],R[2],0,  R[3],R[4],R[5],0,  R[6],R[7],R[8],0,  t[0],t[1],t[2],1 };
     }
     private static float[] composeTRS_Tpre(float[] C){
         return new float[]{ 1,0,0,0, 0,1,0,0, 0,0,1,0,  -C[0],-C[1],-C[2],1 };
@@ -439,15 +421,23 @@ public final class AssimpDracoDecode {
     private record WorldStats(float[] center,double diag,float[] half){}
     private static WorldStats worldStatsFromOriginal(AIScene scene){
         MinMax mm = new MinMax();
-        buildAndAccumulate(scene.mRootNode(), new float[]{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}, scene.mMeshes(), mm);
+        buildAndAccumulate(scene.mRootNode(), new float[]{1,0,0,0, 0,1,0,0, 0,0,1,0,  0,0,0,1}, scene.mMeshes(), mm);
         if (!mm.valid){ mm.minX=mm.minY=mm.minZ=-0.5; mm.maxX=mm.maxY=mm.maxZ=0.5; }
         float cx=(float)((mm.minX+mm.maxX)/2.0), cy=(float)((mm.minY+mm.maxY)/2.0), cz=(float)((mm.minZ+mm.maxZ)/2.0);
         double dx=mm.maxX-mm.minX, dy=mm.maxY-mm.minY, dz=mm.maxZ-mm.minZ, diag=Math.sqrt(dx*dx+dy*dy+dz*dz);
         float hx=(float)(dx*0.5), hy=(float)(dy*0.5), hz=(float)(dz*0.5);
         return new WorldStats(new float[]{cx,cy,cz}, diag, new float[]{hx,hy,hz});
     }
-    private static final class MinMax{ boolean valid=false; double minX=Double.POSITIVE_INFINITY,minY=Double.POSITIVE_INFINITY,minZ=Double.POSITIVE_INFINITY, maxX=Double.NEGATIVE_INFINITY,maxY=Double.NEGATIVE_INFINITY,maxZ=Double.NEGATIVE_INFINITY;
-        void grow(double mnx,double mny,double mnz,double mxx,double mxy,double mxz){ if (mnx<minX)minX=mnx; if (mny<minY)minY=mny; if (mnz<minZ)minZ=mnz; if (mxx>maxX)maxX=mxx; if (mxy>maxY)maxY=mxy; if (mxz>maxZ)maxZ=mxz; valid=true; } }
+    private static final class MinMax{
+        boolean valid=false;
+        double minX=Double.POSITIVE_INFINITY,minY=Double.POSITIVE_INFINITY,minZ=Double.POSITIVE_INFINITY,
+               maxX=Double.NEGATIVE_INFINITY,maxY=Double.NEGATIVE_INFINITY,maxZ=Double.NEGATIVE_INFINITY;
+        void grow(double mnx,double mny,double mnz,double mxx,double mxy,double mxz){
+            if (mnx<minX)minX=mnx; if (mny<minY)minY=mny; if (mnz<minZ)minZ=mnz;
+            if (mxx>maxX)maxX=mxx; if (mxy>maxY)maxY=mxy; if (mxz>maxZ)maxZ=mxz;
+            valid=true;
+        }
+    }
     private static void buildAndAccumulate(AINode node,float[] parentCM,PointerBuffer meshesBuf,MinMax mm){
         float[] local = toCM(node.mTransformation());
         float[] world = mat4Mul(parentCM, local);
